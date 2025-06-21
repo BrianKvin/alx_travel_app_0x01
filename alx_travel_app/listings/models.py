@@ -2,7 +2,7 @@ from django.db import models
 from django.contrib.auth.models import User
 from django.core.validators import MinValueValidator, MaxValueValidator
 import uuid
-
+from django.core.exceptions import ValidationError
 
 class Listing(models.Model):
     """Model representing a property listing"""
@@ -139,7 +139,6 @@ class Booking(models.Model):
     
     def clean(self):
         """Custom validation"""
-        from django.core.exceptions import ValidationError
         
         if self.check_in_date and self.check_out_date:
             if self.check_out_date <= self.check_in_date:
@@ -157,6 +156,7 @@ class Booking(models.Model):
         super().save(*args, **kwargs)
     
     @property
+    # provides a clean way to compute and access derived data without storing it in the database, improving readability and encapsulation.
     def duration_days(self):
         """Calculate booking duration in days"""
         return (self.check_out_date - self.check_in_date).days
