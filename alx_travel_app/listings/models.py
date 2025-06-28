@@ -1,206 +1,98 @@
 from django.db import models
 from django.contrib.auth.models import User
-from django.core.validators import MinValueValidator, MaxValueValidator
 import uuid
-from django.core.exceptions import ValidationError
 
 class Listing(models.Model):
-    """Model representing a property listing"""
-    
-    PROPERTY_TYPES = [
-         ('apartment', 'Apartment'),
-        ('house', 'House'),
-        ('condo', 'Condominium'),
-        ('villa', 'Villa'),
-        ('cabin', 'Cabin'),
-        ('loft', 'Loft'),
-        ('studio', 'Studio'),
-    ]
-    
-    listing_id = models.UUIDField(
-        primary_key=True, 
-        default=uuid.uuid4, 
-        editable=False
-    )
-    host = models.ForeignKey(
-        User, 
-        on_delete=models.CASCADE, 
-        related_name='listings'
-    )
-    title = models.CharField(max_length=200)
+    """Existing Listing model - add this if not present"""
+    title = models.CharField(max_length=255)
     description = models.TextField()
-    location = models.CharField(max_length=200)
-    price_per_night = models.DecimalField(
-        max_digits=10, 
-        decimal_places=2,
-        validators=[MinValueValidator(0.01)]
-    )
-    property_type = models.CharField(
-        max_length=20, 
-        choices=PROPERTY_TYPES,
-        default='apartment'
-    )
-    max_guests = models.PositiveIntegerField(
-        validators=[MinValueValidator(1)]
-    )
-    bedrooms = models.PositiveIntegerField(default=1)
-    bathrooms = models.PositiveIntegerField(default=1)
-    amenities = models.TextField(
-        help_text="Comma-separated list of amenities",
-        blank=True
-    )
-    available = models.BooleanField(default=True)
+    price_per_night = models.DecimalField(max_digits=10, decimal_places=2)
+    location = models.CharField(max_length=255)
+    host = models.ForeignKey(User, on_delete=models.CASCADE, related_name='listings')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-    
-    class Meta:
-        ordering = ['-created_at']
-        indexes = [
-            models.Index(fields=['location']),
-            models.Index(fields=['property_type']),
-            models.Index(fields=['price_per_night']),
-            models.Index(fields=['available']),
-        ]
-    
-    def __str__(self):
-        return f"{self.title} - {self.location}"
-    
-    def get_amenities_list(self):
-        """Return amenities as a list"""
-        if self.amenities:
-            return [amenity.strip() for amenity in self.amenities.split(',')]
-        return []
-    
-    def average_rating(self):
-        """Calculate average rating from reviews"""
-        reviews = self.reviews.all()
-        if reviews:
-            return reviews.aggregate(models.Avg('rating'))['rating__avg']
-        return 0.0
 
+    def __str__(self):
+        return self.title
 
 class Booking(models.Model):
-    """Model representing a booking for a listing"""
-    
-    STATUS_CHOICES = [
+    """Existing Booking model - add this if not present"""
+    BOOKING_STATUS_CHOICES = [
         ('pending', 'Pending'),
         ('confirmed', 'Confirmed'),
         ('cancelled', 'Cancelled'),
         ('completed', 'Completed'),
     ]
     
-    booking_id = models.UUIDField(
-        primary_key=True, 
-        default=uuid.uuid4, 
-        editable=False
-    )
-    listing = models.ForeignKey(
-        Listing, 
-        on_delete=models.CASCADE, 
-        related_name='bookings'
-    )
-    guest = models.ForeignKey(
-        User, 
-        on_delete=models.CASCADE, 
-        related_name='bookings'
-    )
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    listing = models.ForeignKey(Listing, on_delete=models.CASCADE, related_name='bookings')
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='bookings')
     check_in_date = models.DateField()
     check_out_date = models.DateField()
-    number_of_guests = models.PositiveIntegerField(
-        validators=[MinValueValidator(1)]
-    )
-    total_price = models.DecimalField(
-        max_digits=10, 
-        decimal_places=2
-    )
-    status = models.CharField(
-        max_length=20, 
-        choices=STATUS_CHOICES,
-        default='pending'
-    )
+    total_amount = models.DecimalField(max_digits=10, decimal_places=2)
+    status = models.CharField(max_length=20, choices=BOOKING_STATUS_CHOICES, default='pending')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"Booking {self.id} - {self.listing.title}"
+
+class Payment(models.Model):
+    """Payment model for handling Chapa payment transactions"""
+    PAYMENT_STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('processing', 'Processing'),
+        ('completed', 'Completed'),
+        ('failed', 'Failed'),
+        ('cancelled', 'Cancelled'),
+        ('refunded', 'Refunded'),
+    ]
+    
+    PAYMENT_METHOD_CHOICES = [
+        ('telebirr', 'Telebirr'),
+        ('cbe', 'CBE'),
+        ('ebirr', 'eBirr'),
+        ('mpesa', 'M-Pesa'),
+        ('card', 'Card'),
+    ]
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    booking = models.OneToOneField(Booking, on_delete=models.CASCADE, related_name='payment')
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='payments')
+    
+    # Payment details
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    currency = models.CharField(max_length=3, default='ETB')
+    
+    # Chapa transaction details
+    transaction_id = models.CharField(max_length=255, unique=True, null=True, blank=True)
+    checkout_url = models.URLField(null=True, blank=True)
+    reference = models.CharField(max_length=255, unique=True)
+    
+    # Payment status and method
+    status = models.CharField(max_length=20, choices=PAYMENT_STATUS_CHOICES, default='pending')
+    payment_method = models.CharField(max_length=20, choices=PAYMENT_METHOD_CHOICES, null=True, blank=True)
+    
+    # Timestamps
+    initiated_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    # Additional Chapa response data
+    chapa_response = models.JSONField(null=True, blank=True)
+    webhook_data = models.JSONField(null=True, blank=True)
+    
+    # Metadata
+    metadata = models.JSONField(null=True, blank=True)
     
     class Meta:
-        ordering = ['-created_at']
-        indexes = [
-            models.Index(fields=['check_in_date', 'check_out_date']),
-            models.Index(fields=['status']),
-        ]
-        constraints = [
-            models.CheckConstraint(
-                check=models.Q(check_out_date__gt=models.F('check_in_date')),
-                name='check_out_after_check_in'
-            )
-        ]
-    
+        ordering = ['-initiated_at']
+        
     def __str__(self):
-        return f"Booking {self.booking_id} - {self.listing.title}"
-    
-    def clean(self):
-        """Custom validation"""
-        
-        if self.check_in_date and self.check_out_date:
-            if self.check_out_date <= self.check_in_date:
-                raise ValidationError("Check-out date must be after check-in date")
-        
-        if self.number_of_guests and self.listing:
-            if self.number_of_guests > self.listing.max_guests:
-                raise ValidationError(
-                    f"Number of guests ({self.number_of_guests}) exceeds "
-                    f"maximum allowed ({self.listing.max_guests})"
-                )
+        return f"Payment {self.reference} - {self.amount} {self.currency}"
     
     def save(self, *args, **kwargs):
-        self.full_clean()
+        if not self.reference:
+            # Generate unique reference
+            self.reference = f"ALX_TRAVEL_{uuid.uuid4().hex[:8].upper()}"
         super().save(*args, **kwargs)
-    
-    @property
-    # provides a clean way to compute and access derived data without storing it in the database, improving readability and encapsulation.
-    def duration_days(self):
-        """Calculate booking duration in days"""
-        return (self.check_out_date - self.check_in_date).days
-
-
-class Review(models.Model):
-    """Model representing a review for a listing"""
-    
-    review_id = models.UUIDField(
-        primary_key=True, 
-        default=uuid.uuid4, 
-        editable=False
-    )
-    listing = models.ForeignKey(
-        Listing, 
-        on_delete=models.CASCADE, 
-        related_name='reviews'
-    )
-    guest = models.ForeignKey(
-        User, 
-        on_delete=models.CASCADE, 
-        related_name='reviews'
-    )
-    booking = models.OneToOneField(
-        Booking, 
-        on_delete=models.CASCADE, 
-        related_name='review',
-        null=True, 
-        blank=True
-    )
-    rating = models.PositiveIntegerField(
-        validators=[MinValueValidator(1), MaxValueValidator(5)]
-    )
-    comment = models.TextField()
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-    
-    class Meta:
-        ordering = ['-created_at']
-        unique_together = ['listing', 'guest', 'booking']
-        indexes = [
-            models.Index(fields=['rating']),
-            models.Index(fields=['created_at']),
-        ]
-    
-    def __str__(self):
-        return f"Review by {self.guest.username} for {self.listing.title} - {self.rating}/5"

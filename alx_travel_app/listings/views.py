@@ -1,730 +1,412 @@
-from rest_framework import viewsets, status, permissions, filters
-from rest_framework.decorators import action
-from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated, IsAuthenticatedOrReadOnly
-from alx_travel_app.listings import serializers
-from django_filters.rest_framework import DjangoFilterBackend
-from django.shortcuts import get_object_or_404
-from django.contrib.auth.models import User
-from django.db.models import Q, Avg
+import os
+import requests
+import json
+import logging
 from decimal import Decimal
-from .models import Listing, Booking, Review
-from .serializers import (
-    ListingSerializer, ListingCreateUpdateSerializer, ListingListSerializer,
-    BookingSerializer, BookingCreateSerializer,
-    ReviewSerializer, ReviewCreateSerializer,
-    UserSerializer
-)
+from datetime import datetime
+from django.conf import settings
+from django.shortcuts import get_object_or_404
+from django.utils import timezone
+from django.core.mail import send_mail
+from django.template.loader import render_to_string
+from rest_framework import status
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from celery import shared_task
+from .models import Booking, Payment, Listing
+from .serializers import PaymentSerializer, BookingSerializer
 
-# ============= LISTING VIEWSETS =============
-class ListingViewSet(viewsets.ModelViewSet):
+logger = logging.getLogger(__name__)
+
+# Chapa API Configuration
+CHAPA_BASE_URL = "https://api.chapa.co/v1"
+CHAPA_SECRET_KEY = os.getenv('CHAPA_SECRET_KEY')
+
+if not CHAPA_SECRET_KEY:
+    logger.error("CHAPA_SECRET_KEY environment variable not set")
+
+class ChapaAPI:
+    """Chapa API wrapper for payment operations"""
+    
+    def __init__(self):
+        self.base_url = CHAPA_BASE_URL
+        self.secret_key = CHAPA_SECRET_KEY
+        self.headers = {
+            'Authorization': f'Bearer {self.secret_key}',
+            'Content-Type': 'application/json'
+        }
+    
+    def initialize_payment(self, payment_data):
+        """Initialize payment with Chapa API"""
+        url = f"{self.base_url}/transaction/initialize"
+        
+        try:
+            response = requests.post(url, headers=self.headers, json=payment_data)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Chapa payment initialization error: {str(e)}")
+            return None
+    
+    def verify_payment(self, transaction_id):
+        """Verify payment status with Chapa API"""
+        url = f"{self.base_url}/transaction/verify/{transaction_id}"
+        
+        try:
+            response = requests.get(url, headers=self.headers)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Chapa payment verification error: {str(e)}")
+            return None
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def initiate_payment(request):
     """
-    A ViewSet for viewing and editing listings.
-    Provides list, retrieve, create, update, partial_update, and destroy actions.
+    Initiate payment for a booking
     """
-    queryset = Listing.objects.all()
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['property_type', 'location', 'available']
-    search_fields = ['title', 'description', 'location']
-    ordering_fields = ['price_per_night', 'created_at', 'bedrooms', 'max_guests']
-    ordering = ['-created_at']
-    lookup_field = 'listing_id'
-
-    def get_serializer_class(self):
-        if self.action in ['list', 'retrieve', 'search']:
-            return ListingListSerializer
-        elif self.action in ['create', 'update', 'partial_update']:
-            return ListingCreateUpdateSerializer
-        return ListingSerializer
-
-    def get_permissions(self):
-        if self.action in ['create']:
-            self.permission_classes = [IsAuthenticated]
-        elif self.action in ['update', 'partial_update', 'destroy']:
-            self.permission_classes = [IsAuthenticated]
-        else:
-            self.permission_classes = [permissions.AllowAny]
-        return super().get_permissions()
-
-    def get_queryset(self):
-        queryset = super().get_queryset()
-
-        if self.action == 'my_listings':
-            return queryset.filter(host=self.request.user)
-
-        # Apply general listing filters for 'list' and 'search' actions
-        if self.action in ['list', 'search']:
-            queryset = queryset.filter(available=True)
-
-            min_price = self.request.query_params.get('min_price')
-            max_price = self.request.query_params.get('max_price')
-            if min_price:
-                queryset = queryset.filter(price_per_night__gte=Decimal(min_price))
-            if max_price:
-                queryset = queryset.filter(price_per_night__lte=Decimal(max_price))
-
-            guests = self.request.query_params.get('guests')
-            if guests:
-                queryset = queryset.filter(max_guests__gte=int(guests))
-
-            bedrooms = self.request.query_params.get('bedrooms')
-            if bedrooms:
-                queryset = queryset.filter(bedrooms__gte=int(bedrooms))
-
-        if self.action in ['update', 'partial_update', 'destroy']:
-            return queryset.filter(host=self.request.user)
-
-        return queryset
-
-    def perform_create(self, serializer):
-        serializer.save(host=self.request.user)
-
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated], url_path='my-listings')
-    def my_listings(self, request):
-        """
-        List current user's listings.
-        """
-        queryset = self.get_queryset()
-        serializer = self.get_serializer(queryset, many=True)
-        return Response(serializer.data)
-
-    @action(detail=False, methods=['get'], permission_classes=[permissions.AllowAny])
-    def search(self, request):
-        """Advanced search endpoint with multiple filters."""
-        queryset = self.get_queryset() # This already applies basic filters for available listings
-
-        # Location search
-        location = request.GET.get('location')
-        if location:
-            queryset = queryset.filter(
-                Q(location__icontains=location) | Q(title__icontains=location)
-            )
-
-        # Date availability check
-        check_in = request.GET.get('check_in')
-        check_out = request.GET.get('check_out')
-        if check_in and check_out:
-            unavailable_listings = Booking.objects.filter(
-                status__in=['confirmed', 'pending'],
-                check_in_date__lt=check_out,
-                check_out_date__gt=check_in
-            ).values_list('listing_id', flat=True)
-            queryset = queryset.exclude(listing_id__in=unavailable_listings)
-
-        # Other filters (already handled in get_queryset for general 'list' behavior, but explicitly for 'search' here)
-        property_type = request.GET.get('property_type')
-        if property_type:
-            queryset = queryset.filter(property_type=property_type)
-
-        # Sorting
-        sort_by = request.GET.get('sort_by', 'created_at')
-        if sort_by == 'price_low':
-            queryset = queryset.order_by('price_per_night')
-        elif sort_by == 'price_high':
-            queryset = queryset.order_by('-price_per_night')
-        elif sort_by == 'rating':
-            queryset = queryset.annotate(avg_rating=Avg('reviews__rating')).order_by('-avg_rating')
-        else:
-            queryset = queryset.order_by('-created_at')
-
-        serializer = self.get_serializer(queryset, many=True)
-        return Response(serializer.data)
-
-# ============= BOOKING VIEWSET =============
-class BookingViewSet(viewsets.ModelViewSet):
-    """
-    A ViewSet for viewing and managing bookings.
-    Provides list, retrieve, create, update, partial_update, and destroy (not explicitly for guests).
-    """
-    queryset = Booking.objects.all()
-    permission_classes = [IsAuthenticated]
-    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
-    filterset_fields = ['status']
-    ordering_fields = ['check_in_date', 'created_at']
-    ordering = ['-created_at']
-    lookup_field = 'booking_id'
-
-    def get_serializer_class(self):
-        if self.action == 'create':
-            return BookingCreateSerializer
-        return BookingSerializer
-
-    def get_queryset(self):
-        user = self.request.user
-        if self.action == 'list' or self.action == 'retrieve':
-            return Booking.objects.filter(guest=user)
-        elif self.action == 'host_bookings':
-            return Booking.objects.filter(listing__host=user)
-        elif self.action in ['update', 'partial_update']:
-            # Guests can only cancel, hosts can update status
-            return Booking.objects.filter(Q(guest=user) | Q(listing__host=user))
-        return super().get_queryset()
-
-    def perform_create(self, serializer):
-        serializer.save(guest=self.request.user)
-
-    def update(self, request, *args, **kwargs):
-        booking = self.get_object()
-        user = request.user
-
-        # Only allow status updates
-        if 'status' not in request.data:
+    try:
+        booking_id = request.data.get('booking_id')
+        return_url = request.data.get('return_url', 'http://localhost:3000/payment/success')
+        cancel_url = request.data.get('cancel_url', 'http://localhost:3000/payment/cancel')
+        
+        if not booking_id:
             return Response(
-                {'error': 'Only status updates are allowed'},
+                {'error': 'booking_id is required'}, 
                 status=status.HTTP_400_BAD_REQUEST
             )
+        
+        # Get booking
+        booking = get_object_or_404(Booking, id=booking_id, user=request.user)
+        
+        # Check if payment already exists
+        if hasattr(booking, 'payment') and booking.payment.status in ['completed', 'processing']:
+            return Response(
+                {'error': 'Payment already exists for this booking'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Create or get payment record
+        payment, created = Payment.objects.get_or_create(
+            booking=booking,
+            defaults={
+                'user': request.user,
+                'amount': booking.total_amount,
+                'currency': 'ETB',
+                'status': 'pending'
+            }
+        )
+        
+        # Prepare Chapa payment data
+        chapa_data = {
+            'amount': str(payment.amount),
+            'currency': payment.currency,
+            'email': request.user.email,
+            'first_name': request.user.first_name or 'Guest',
+            'last_name': request.user.last_name or 'User',
+            'phone_number': request.data.get('phone_number', ''),
+            'tx_ref': payment.reference,
+            'callback_url': f"{request.build_absolute_uri('/api/payments/webhook/')}",
+            'return_url': return_url,
+            'customization': {
+                'title': f'ALX Travel - {booking.listing.title}',
+                'description': f'Payment for booking from {booking.check_in_date} to {booking.check_out_date}',
+                'logo': 'https://your-logo-url.com/logo.png'
+            },
+            'metadata': {
+                'booking_id': str(booking.id),
+                'user_id': str(request.user.id),
+                'listing_title': booking.listing.title
+            }
+        }
+        
+        # Initialize payment with Chapa
+        chapa_api = ChapaAPI()
+        chapa_response = chapa_api.initialize_payment(chapa_data)
+        
+        if not chapa_response:
+            return Response(
+                {'error': 'Failed to initialize payment with Chapa'}, 
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        
+        # Update payment record
+        if chapa_response.get('status') == 'success':
+            payment.checkout_url = chapa_response['data']['checkout_url']
+            payment.chapa_response = chapa_response
+            payment.status = 'processing'
+            payment.save()
+            
+            # Update booking status
+            booking.status = 'pending'
+            booking.save()
+            
+            return Response({
+                'success': True,
+                'payment_id': str(payment.id),
+                'checkout_url': payment.checkout_url,
+                'reference': payment.reference,
+                'amount': payment.amount,
+                'currency': payment.currency
+            })
+        else:
+            payment.status = 'failed'
+            payment.chapa_response = chapa_response
+            payment.save()
+            
+            return Response(
+                {'error': 'Payment initialization failed', 'details': chapa_response}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+            
+    except Exception as e:
+        logger.error(f"Payment initiation error: {str(e)}")
+        return Response(
+            {'error': 'Internal server error'}, 
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
-        new_status = request.data.get('status')
-
-        # Validate status transitions
-        if booking.guest == user:
-            # Guests can only cancel their own bookings
-            if new_status != 'cancelled':
-                return Response(
-                    {'error': 'Guests can only cancel bookings'},
-                    status=status.HTTP_403_FORBIDDEN
-                )
-        elif booking.listing.host == user:
-            # Hosts can confirm, cancel, or mark as completed
-            if new_status not in ['confirmed', 'cancelled', 'completed']:
-                return Response(
-                    {'error': 'Invalid status transition'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def verify_payment(request, reference):
+    """
+    Verify payment status
+    """
+    try:
+        payment = get_object_or_404(Payment, reference=reference, user=request.user)
+        
+        # Verify with Chapa API
+        chapa_api = ChapaAPI()
+        chapa_response = chapa_api.verify_payment(reference)
+        
+        if not chapa_response:
+            return Response(
+                {'error': 'Failed to verify payment with Chapa'}, 
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        
+        # Update payment status based on Chapa response
+        if chapa_response.get('status') == 'success':
+            chapa_status = chapa_response['data']['status']
+            
+            if chapa_status == 'success':
+                payment.status = 'completed'
+                payment.completed_at = timezone.now()
+                payment.payment_method = chapa_response['data'].get('method', '')
+                payment.transaction_id = chapa_response['data'].get('tx_ref', '')
+                
+                # Update booking status
+                payment.booking.status = 'confirmed'
+                payment.booking.save()
+                
+                # Send confirmation email asynchronously
+                send_booking_confirmation_email.delay(payment.booking.id)
+                
+            elif chapa_status == 'failed':
+                payment.status = 'failed'
+            else:
+                payment.status = 'processing'
+            
+            payment.chapa_response = chapa_response
+            payment.save()
+            
+            return Response({
+                'success': True,
+                'payment_status': payment.status,
+                'booking_status': payment.booking.status,
+                'transaction_id': payment.transaction_id,
+                'payment_method': payment.payment_method
+            })
         else:
             return Response(
-                {'error': 'Permission denied'},
-                status=status.HTTP_403_FORBIDDEN
+                {'error': 'Payment verification failed', 'details': chapa_response}, 
+                status=status.HTTP_400_BAD_REQUEST
             )
+            
+    except Exception as e:
+        logger.error(f"Payment verification error: {str(e)}")
+        return Response(
+            {'error': 'Internal server error'}, 
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
-        booking.status = new_status
-        booking.save()
+@api_view(['POST'])
+def payment_webhook(request):
+    """
+    Handle Chapa webhook notifications
+    """
+    try:
+        webhook_data = request.data
+        tx_ref = webhook_data.get('tx_ref')
+        
+        if not tx_ref:
+            return Response({'error': 'tx_ref not provided'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Get payment record
+        try:
+            payment = Payment.objects.get(reference=tx_ref)
+        except Payment.DoesNotExist:
+            logger.warning(f"Payment not found for reference: {tx_ref}")
+            return Response({'error': 'Payment not found'}, status=status.HTTP_404_NOT_FOUND)
+        
+        # Update payment with webhook data
+        payment.webhook_data = webhook_data
+        
+        # Update status based on webhook
+        webhook_status = webhook_data.get('status')
+        if webhook_status == 'success':
+            payment.status = 'completed'
+            payment.completed_at = timezone.now()
+            payment.transaction_id = webhook_data.get('trx_ref', '')
+            
+            # Update booking
+            payment.booking.status = 'confirmed'
+            payment.booking.save()
+            
+            # Send confirmation email
+            send_booking_confirmation_email.delay(payment.booking.id)
+            
+        elif webhook_status == 'failed':
+            payment.status = 'failed'
+        
+        payment.save()
+        
+        return Response({'success': True})
+        
+    except Exception as e:
+        logger.error(f"Webhook processing error: {str(e)}")
+        return Response(
+            {'error': 'Internal server error'}, 
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
-        serializer = self.get_serializer(booking)
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def payment_status(request, payment_id):
+    """
+    Get payment status
+    """
+    try:
+        payment = get_object_or_404(Payment, id=payment_id, user=request.user)
+        serializer = PaymentSerializer(payment)
         return Response(serializer.data)
+    except Exception as e:
+        logger.error(f"Payment status error: {str(e)}")
+        return Response(
+            {'error': 'Internal server error'}, 
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated], url_path='host-bookings')
-    def host_bookings(self, request):
-        """
-        List bookings for host's listings.
-        """
-        queryset = self.get_queryset()
-        serializer = self.get_serializer(queryset, many=True)
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def user_payments(request):
+    """
+    Get user's payment history
+    """
+    try:
+        payments = Payment.objects.filter(user=request.user)
+        serializer = PaymentSerializer(payments, many=True)
         return Response(serializer.data)
+    except Exception as e:
+        logger.error(f"User payments error: {str(e)}")
+        return Response(
+            {'error': 'Internal server error'}, 
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
-# ============= REVIEW VIEWSET =============
-class ReviewViewSet(viewsets.ModelViewSet):
+# Celery task for sending confirmation emails
+@shared_task
+def send_booking_confirmation_email(booking_id):
     """
-    A ViewSet for viewing and managing reviews.
-    Provides list, retrieve, create, update, partial_update, and destroy actions.
+    Send booking confirmation email asynchronously
     """
-    queryset = Review.objects.all()
-    filter_backends = [filters.OrderingFilter]
-    ordering_fields = ['rating', 'created_at']
-    ordering = ['-created_at']
-    lookup_field = 'review_id'
-
-    def get_serializer_class(self):
-        if self.action == 'create':
-            return ReviewCreateSerializer
-        return ReviewSerializer
-
-    def get_permissions(self):
-        if self.action in ['create']:
-            self.permission_classes = [IsAuthenticated]
-        elif self.action in ['update', 'partial_update', 'destroy']:
-            self.permission_classes = [IsAuthenticated]
-        else:
-            self.permission_classes = [permissions.AllowAny]
-        return super().get_permissions()
-
-    def get_queryset(self):
-        queryset = super().get_queryset()
-
-        if self.action == 'list':
-            listing_id = self.kwargs.get('listing_id')
-            if listing_id:
-                return queryset.filter(listing__listing_id=listing_id)
-            # If listing_id is not provided for list, it will return all reviews,
-            # which might not be desired for a general 'list' without a specific listing context.
-            # Consider if you want a global list or only listing-specific.
-            # For now, it will return all reviews if no listing_id is in kwargs.
-            return queryset
-        elif self.action in ['update', 'partial_update', 'destroy', 'my_reviews']:
-            return queryset.filter(guest=self.request.user)
-        return queryset
-
-    def perform_create(self, serializer):
-        # Ensure the review is for a completed booking
-        booking_id = self.request.data.get('booking')
-        if not booking_id:
-            raise serializers.ValidationError({"booking": "Booking ID is required."})
-
-        booking = get_object_or_404(Booking, booking_id=booking_id, guest=self.request.user, status='completed')
-        if Review.objects.filter(booking=booking).exists():
-            raise serializers.ValidationError({"booking": "A review for this booking already exists."})
-
-        serializer.save(guest=self.request.user, listing=booking.listing)
-
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated], url_path='my-reviews')
-    def my_reviews(self, request):
-        """
-        List current user's reviews.
-        """
-        queryset = self.get_queryset()
-        serializer = self.get_serializer(queryset, many=True)
-        return Response(serializer.data)
-
-# ============= UTILITY VIEWSET (Custom) =============
-class UtilityViewSet(viewsets.ViewSet):
-    """
-    A ViewSet for various utility endpoints like dashboard statistics and property types.
-    """
-    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
-    def dashboard_stats(self, request):
-        """Get dashboard statistics for the current user"""
-        user = request.user
-
-        # Guest stats
-        guest_bookings = Booking.objects.filter(guest=user)
-        guest_stats = {
-            'total_bookings': guest_bookings.count(),
-            'confirmed_bookings': guest_bookings.filter(status='confirmed').count(),
-            'completed_bookings': guest_bookings.filter(status='completed').count(),
-            'cancelled_bookings': guest_bookings.filter(status='cancelled').count(),
-            'total_reviews_given': Review.objects.filter(guest=user).count(),
-        }
-
-        # Host stats
-        host_listings = Listing.objects.filter(host=user)
-        host_bookings = Booking.objects.filter(listing__host=user)
-        host_stats = {
-            'total_listings': host_listings.count(),
-            'active_listings': host_listings.filter(available=True).count(),
-            'total_bookings_received': host_bookings.count(),
-            'confirmed_bookings_received': host_bookings.filter(status='confirmed').count(),
-            'total_reviews_received': Review.objects.filter(listing__host=user).count(),
-            'average_rating': Review.objects.filter(listing__host=user).aggregate(
-                avg_rating=Avg('rating')
-            )['avg_rating'] or 0.0
-        }
-
-        return Response({
-            'guest_stats': guest_stats,
-            'host_stats': host_stats
+    try:
+        booking = Booking.objects.get(id=booking_id)
+        user = booking.user
+        
+        subject = f'Booking Confirmation - {booking.listing.title}'
+        
+        # Render email template
+        html_message = render_to_string('emails/booking_confirmation.html', {
+            'user': user,
+            'booking': booking,
+            'listing': booking.listing,
+            'payment': booking.payment
         })
-
-    @action(detail=False, methods=['get'], permission_classes=[permissions.AllowAny])
-    def property_types(self, request):
-        """Get available property types"""
-        return Response([
-            {'value': choice[0], 'label': choice[1]}
-            for choice in Listing.PROPERTY_TYPES
-        ])
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# # ============= LISTING VIEWS =============
-
-# class ListingListView(generics.ListAPIView):
-#     """List all available listings with filtering and search"""
-    
-#     serializer_class = ListingListSerializer
-#     permission_classes = [permissions.AllowAny]
-#     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-#     filterset_fields = ['property_type', 'location', 'available']
-#     search_fields = ['title', 'description', 'location']
-#     ordering_fields = ['price_per_night', 'created_at', 'bedrooms', 'max_guests']
-#     ordering = ['-created_at']
-    
-#     def get_queryset(self):
-#         queryset = Listing.objects.filter(available=True)
         
-#         # Price range filtering
-#         min_price = self.request.query_params.get('min_price')
-#         max_price = self.request.query_params.get('max_price')
+        plain_message = f"""
+        Dear {user.first_name or 'Guest'},
         
-#         if min_price:
-#             queryset = queryset.filter(price_per_night__gte=Decimal(min_price))
-#         if max_price:
-#             queryset = queryset.filter(price_per_night__lte=Decimal(max_price))
+        Your booking has been confirmed!
         
-#         # Guest capacity filtering
-#         guests = self.request.query_params.get('guests')
-#         if guests:
-#             queryset = queryset.filter(max_guests__gte=int(guests))
+        Booking Details:
+        - Property: {booking.listing.title}
+        - Check-in: {booking.check_in_date}
+        - Check-out: {booking.check_out_date}
+        - Total Amount: {booking.total_amount} ETB
+        - Reference: {booking.payment.reference}
         
-#         # Bedrooms filtering
-#         bedrooms = self.request.query_params.get('bedrooms')
-#         if bedrooms:
-#             queryset = queryset.filter(bedrooms__gte=int(bedrooms))
+        Thank you for choosing ALX Travel!
         
-#         return queryset
-
-
-# class ListingDetailView(generics.RetrieveAPIView):
-#     """Retrieve a single listing by ID"""
-    
-#     queryset = Listing.objects.all()
-#     serializer_class = ListingSerializer
-#     permission_classes = [permissions.AllowAny]
-#     lookup_field = 'listing_id'
-
-
-# class ListingCreateView(generics.CreateAPIView):
-#     """Create a new listing (host only)"""
-    
-#     serializer_class = ListingCreateUpdateSerializer
-#     permission_classes = [IsAuthenticated]
-    
-#     def perform_create(self, serializer):
-#         serializer.save(host=self.request.user)
-
-
-# class ListingUpdateView(generics.UpdateAPIView):
-#     """Update a listing (owner only)"""
-    
-#     serializer_class = ListingCreateUpdateSerializer
-#     permission_classes = [IsAuthenticated]
-#     lookup_field = 'listing_id'
-    
-#     def get_queryset(self):
-#         return Listing.objects.filter(host=self.request.user)
-
-
-# class ListingDeleteView(generics.DestroyAPIView):
-#     """Delete a listing (owner only)"""
-    
-#     permission_classes = [IsAuthenticated]
-#     lookup_field = 'listing_id'
-    
-#     def get_queryset(self):
-#         return Listing.objects.filter(host=self.request.user)
-
-
-# class MyListingsView(generics.ListAPIView):
-#     """List current user's listings"""
-    
-#     serializer_class = ListingSerializer
-#     permission_classes = [IsAuthenticated]
-    
-#     def get_queryset(self):
-#         return Listing.objects.filter(host=self.request.user)
-
-
-# # ============= BOOKING VIEWS =============
-
-# class BookingCreateView(generics.CreateAPIView):
-#     """Create a new booking"""
-    
-#     serializer_class = BookingCreateSerializer
-#     permission_classes = [IsAuthenticated]
-
-
-# class BookingListView(generics.ListAPIView):
-#     """List user's bookings"""
-    
-#     serializer_class = BookingSerializer
-#     permission_classes = [IsAuthenticated]
-#     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
-#     filterset_fields = ['status']
-#     ordering_fields = ['check_in_date', 'created_at']
-#     ordering = ['-created_at']
-    
-#     def get_queryset(self):
-#         return Booking.objects.filter(guest=self.request.user)
-
-
-# class BookingDetailView(generics.RetrieveAPIView):
-#     """Retrieve a single booking"""
-    
-#     serializer_class = BookingSerializer
-#     permission_classes = [IsAuthenticated]
-#     lookup_field = 'booking_id'
-    
-#     def get_queryset(self):
-#         return Booking.objects.filter(guest=self.request.user)
-
-
-# class BookingUpdateView(generics.UpdateAPIView):
-#     """Update booking status (limited fields)"""
-    
-#     serializer_class = BookingSerializer
-#     permission_classes = [IsAuthenticated]
-#     lookup_field = 'booking_id'
-    
-#     def get_queryset(self):
-#         # Guests can only cancel, hosts can update status
-#         user = self.request.user
-#         return Booking.objects.filter(
-#             Q(guest=user) | Q(listing__host=user)
-#         )
-    
-#     def update(self, request, *args, **kwargs):
-#         booking = self.get_object()
+        Best regards,
+        ALX Travel Team
+        """
         
-#         # Only allow status updates
-#         if 'status' not in request.data:
-#             return Response(
-#                 {'error': 'Only status updates are allowed'},
-#                 status=status.HTTP_400_BAD_REQUEST
-#             )
+        send_mail(
+            subject=subject,
+            message=plain_message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[user.email],
+            html_message=html_message,
+            fail_silently=False,
+        )
         
-#         new_status = request.data.get('status')
+        logger.info(f"Confirmation email sent for booking {booking_id}")
         
-#         # Validate status transitions
-#         if booking.guest == request.user:
-#             # Guests can only cancel their own bookings
-#             if new_status != 'cancelled':
-#                 return Response(
-#                     {'error': 'Guests can only cancel bookings'},
-#                     status=status.HTTP_403_FORBIDDEN
-#                 )
-#         elif booking.listing.host == request.user:
-#             # Hosts can confirm or cancel bookings
-#             if new_status not in ['confirmed', 'cancelled', 'completed']:
-#                 return Response(
-#                     {'error': 'Invalid status transition'},
-#                     status=status.HTTP_400_BAD_REQUEST
-#                 )
-#         else:
-#             return Response(
-#                 {'error': 'Permission denied'},
-#                 status=status.HTTP_403_FORBIDDEN
-#             )
+    except Exception as e:
+        logger.error(f"Error sending confirmation email: {str(e)}")
+
+@shared_task
+def send_payment_failure_email(payment_id):
+    """
+    Send payment failure notification email
+    """
+    try:
+        payment = Payment.objects.get(id=payment_id)
+        user = payment.user
+        booking = payment.booking
         
-#         booking.status = new_status
-#         booking.save()
+        subject = f'Payment Failed - {booking.listing.title}'
         
-#         serializer = self.get_serializer(booking)
-#         return Response(serializer.data)
-
-
-# class HostBookingsView(generics.ListAPIView):
-#     """List bookings for host's listings"""
-    
-#     serializer_class = BookingSerializer
-#     permission_classes = [IsAuthenticated]
-#     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
-#     filterset_fields = ['status']
-#     ordering_fields = ['check_in_date', 'created_at']
-#     ordering = ['-created_at']
-    
-#     def get_queryset(self):
-#         return Booking.objects.filter(listing__host=self.request.user)
-
-
-# # ============= REVIEW VIEWS =============
-
-# class ReviewCreateView(generics.CreateAPIView):
-#     """Create a review for a completed booking"""
-    
-#     serializer_class = ReviewCreateSerializer
-#     permission_classes = [IsAuthenticated]
-
-
-# class ReviewListView(generics.ListAPIView):
-#     """List reviews for a specific listing"""
-    
-#     serializer_class = ReviewSerializer
-#     permission_classes = [permissions.AllowAny]
-#     filter_backends = [filters.OrderingFilter]
-#     ordering_fields = ['rating', 'created_at']
-#     ordering = ['-created_at']
-    
-#     def get_queryset(self):
-#         listing_id = self.kwargs.get('listing_id')
-#         return Review.objects.filter(listing__listing_id=listing_id)
-
-
-# class ReviewDetailView(generics.RetrieveAPIView):
-#     """Retrieve a single review"""
-    
-#     serializer_class = ReviewSerializer
-#     permission_classes = [permissions.AllowAny]
-#     lookup_field = 'review_id'
-#     queryset = Review.objects.all()
-
-
-# class ReviewUpdateView(generics.UpdateAPIView):
-#     """Update a review (author only)"""
-    
-#     serializer_class = ReviewCreateSerializer
-#     permission_classes = [IsAuthenticated]
-#     lookup_field = 'review_id'
-    
-#     def get_queryset(self):
-#         return Review.objects.filter(guest=self.request.user)
-
-
-# class ReviewDeleteView(generics.DestroyAPIView):
-#     """Delete a review (author only)"""
-    
-#     permission_classes = [IsAuthenticated]
-#     lookup_field = 'review_id'
-    
-#     def get_queryset(self):
-#         return Review.objects.filter(guest=self.request.user)
-
-
-# class MyReviewsView(generics.ListAPIView):
-#     """List current user's reviews"""
-    
-#     serializer_class = ReviewSerializer
-#     permission_classes = [IsAuthenticated]
-    
-#     def get_queryset(self):
-#         return Review.objects.filter(guest=self.request.user)
-
-
-# # ============= UTILITY VIEWS =============
-
-# @api_view(['GET'])
-# @permission_classes([permissions.AllowAny])
-# def search_listings(request):
-#     """Advanced search endpoint with multiple filters"""
-    
-#     queryset = Listing.objects.filter(available=True)
-    
-#     # Location search
-#     location = request.GET.get('location')
-#     if location:
-#         queryset = queryset.filter(
-#             Q(location__icontains=location) | Q(title__icontains=location)
-#         )
-    
-#     # Date availability check
-#     check_in = request.GET.get('check_in')
-#     check_out = request.GET.get('check_out')
-    
-#     if check_in and check_out:
-#         # Exclude listings with overlapping bookings
-#         unavailable_listings = Booking.objects.filter(
-#             status__in=['confirmed', 'pending'],
-#             check_in_date__lt=check_out,
-#             check_out_date__gt=check_in
-#         ).values_list('listing_id', flat=True)
+        plain_message = f"""
+        Dear {user.first_name or 'Guest'},
         
-#         queryset = queryset.exclude(listing_id__in=unavailable_listings)
-    
-#     # Other filters
-#     property_type = request.GET.get('property_type')
-#     if property_type:
-#         queryset = queryset.filter(property_type=property_type)
-    
-#     min_price = request.GET.get('min_price')
-#     max_price = request.GET.get('max_price')
-#     if min_price:
-#         queryset = queryset.filter(price_per_night__gte=Decimal(min_price))
-#     if max_price:
-#         queryset = queryset.filter(price_per_night__lte=Decimal(max_price))
-    
-#     guests = request.GET.get('guests')
-#     if guests:
-#         queryset = queryset.filter(max_guests__gte=int(guests))
-    
-#     # Sorting
-#     sort_by = request.GET.get('sort_by', 'created_at')
-#     if sort_by == 'price_low':
-#         queryset = queryset.order_by('price_per_night')
-#     elif sort_by == 'price_high':
-#         queryset = queryset.order_by('-price_per_night')
-#     elif sort_by == 'rating':
-#         queryset = queryset.annotate(avg_rating=Avg('reviews__rating')).order_by('-avg_rating')
-#     else:
-#         queryset = queryset.order_by('-created_at')
-    
-#     serializer = ListingListSerializer(queryset, many=True)
-#     return Response(serializer.data)
-
-
-# @api_view(['GET'])
-# @permission_classes([IsAuthenticated])
-# def dashboard_stats(request):
-#     """Get dashboard statistics for the current user"""
-    
-#     user = request.user
-    
-#     # Guest stats
-#     guest_bookings = Booking.objects.filter(guest=user)
-#     guest_stats = {
-#         'total_bookings': guest_bookings.count(),
-#         'confirmed_bookings': guest_bookings.filter(status='confirmed').count(),
-#         'completed_bookings': guest_bookings.filter(status='completed').count(),
-#         'cancelled_bookings': guest_bookings.filter(status='cancelled').count(),
-#         'total_reviews_given': Review.objects.filter(guest=user).count(),
-#     }
-    
-#     # Host stats
-#     host_listings = Listing.objects.filter(host=user)
-#     host_bookings = Booking.objects.filter(listing__host=user)
-#     host_stats = {
-#         'total_listings': host_listings.count(),
-#         'active_listings': host_listings.filter(available=True).count(),
-#         'total_bookings_received': host_bookings.count(),
-#         'confirmed_bookings_received': host_bookings.filter(status='confirmed').count(),
-#         'total_reviews_received': Review.objects.filter(listing__host=user).count(),
-#         'average_rating': Review.objects.filter(listing__host=user).aggregate(
-#             avg_rating=Avg('rating')
-#         )['avg_rating'] or 0.0
-#     }
-    
-#     return Response({
-#         'guest_stats': guest_stats,
-#         'host_stats': host_stats
-#     })
-
-
-# @api_view(['GET'])
-# @permission_classes([permissions.AllowAny])
-# def property_types(request):
-#     """Get available property types"""
-    
-#     return Response([
-#         {'value': choice[0], 'label': choice[1]}
-#         for choice in Listing.PROPERTY_TYPES
-#     ])
+        Unfortunately, your payment for the booking could not be processed.
+        
+        Booking Details:
+        - Property: {booking.listing.title}
+        - Check-in: {booking.check_in_date}
+        - Check-out: {booking.check_out_date}
+        - Amount: {payment.amount} ETB
+        - Reference: {payment.reference}
+        
+        Please try again or contact our support team.
+        
+        Best regards,
+        ALX Travel Team
+        """
+        
+        send_mail(
+            subject=subject,
+            message=plain_message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[user.email],
+            fail_silently=False,
+        )
+        
+        logger.info(f"Payment failure email sent for payment {payment_id}")
+        
+    except Exception as e:
+        logger.error(f"Error sending payment failure email: {str(e)}")
